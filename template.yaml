@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: WhatsApp order handling, invoicing and admin API for the biltong shop
+
+Parameters:
+  WhatsAppToken:
+    Type: String
+    NoEcho: true
+    Description: Permanent access token for the WhatsApp Cloud API (system user token)
+  WhatsAppAppSecret:
+    Type: String
+    NoEcho: true
+    Description: Meta app secret, used to verify webhook signatures
+  WhatsAppVerifyToken:
+    Type: String
+    NoEcho: true
+    Description: Any random string you choose; paste the same value into Meta's webhook setup
+  WhatsAppPhoneNumberId:
+    Type: String
+    Description: Phone number ID from the WhatsApp Cloud API dashboard (not the phone number itself)
+  OrderUpdateTemplate:
+    Type: String
+    Default: ''
+    Description: Optional approved template name for order updates outside the 24h window (body params - 1 order number, 2 message)
+  PayFastMerchantId:
+    Type: String
+  PayFastMerchantKey:
+    Type: String
+    NoEcho: true
+  PayFastPassphrase:
+    Type: String
+    NoEcho: true
+    Default: ''
+  PayFastSandbox:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  BusinessName:
+    Type: String
+    Default: My Biltong Shop
+  BusinessContact:
+    Type: String
+    Default: ''
+    Description: Phone / email printed on invoices
+  BusinessAddress:
+    Type: String
+    Default: ''
+  BankDetails:
+    Type: String
+    Default: ''
+    Description: Optional EFT details printed on invoices (single line, use | to separate)
+  AdminSiteOrigin:
+    Type: String
+    Default: '*'
+    Description: Origin of the admin website for CORS, e.g. https://orders.example.com (use * until the site exists)
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 15
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref Table
+        QUEUE_URL: !Ref MessageQueue
+        INVOICE_BUCKET: !Ref InvoiceBucket
+        WA_TOKEN: !Ref WhatsAppToken
+        WA_APP_SECRET: !Ref WhatsAppAppSecret
+        WA_VERIFY_TOKEN: !Ref WhatsAppVerifyToken
+        WA_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+        WA_ORDER_UPDATE_TEMPLATE: !Ref OrderUpdateTemplate
+        PAYFAST_MERCHANT_ID: !Ref PayFastMerchantId
+        PAYFAST_MERCHANT_KEY: !Ref PayFastMerchantKey
+        PAYFAST_PASSPHRASE: !Ref PayFastPassphrase
+        PAYFAST_SANDBOX: !Ref PayFastSandbox
+        BUSINESS_NAME: !Ref BusinessName
+        BUSINESS_CONTACT: !Ref BusinessContact
+        BUSINESS_ADDRESS: !Ref BusinessAddress
+        BANK_DETAILS: !Ref BankDetails
+        COGNITO_USER_POOL_ID: !Ref UserPool
+        COGNITO_CLIENT_ID: !Ref UserPoolClient
+        NODE_OPTIONS: --enable-source-maps
+
+Resources:
+  # ---------------------------------------------------------------- data
+  # Provisioned 5/5 on the table and both indexes = 15 units, inside the
+  # always-free 25 read / 25 write capacity units.
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+        - { AttributeName: gsi2pk, AttributeType: S }
+        - { AttributeName: gsi2sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+        - IndexName: gsi2
+          KeySchema:
+            - { AttributeName: gsi2pk, KeyType: HASH }
+            - { AttributeName: gsi2sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  InvoiceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  # ---------------------------------------------------------------- queue
+  MessageDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  MessageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MessageDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # ---------------------------------------------------------------- auth
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: biltong-admin
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # ------------------------------------------------------------ functions
+  WhatsAppWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: whatsappWebhook.handler
+      CodeUri: .
+      Description: Receives WhatsApp webhooks, verifies the signature and queues them
+      Timeout: 10
+      Policies:
+        - SQSSendMessagePolicy: { QueueName: !GetAtt MessageQueue.QueueName }
+      FunctionUrlConfig:
+        AuthType: NONE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Target: es2022
+        Sourcemap: true
+        External: ['@aws-sdk/*']
+        EntryPoints: [src/handlers/whatsappWebhook.ts]
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: worker.handler
+      CodeUri: .
+      Description: Runs the order conversation and sends WhatsApp replies and invoices
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          PAYFAST_NOTIFY_URL: !GetAtt PaymentWebhookFunctionUrl.FunctionUrl
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref Table }
+        - S3CrudPolicy: { BucketName: !Ref InvoiceBucket }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt MessageQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Target: es2022
+        Sourcemap: true
+        External: ['@aws-sdk/*']
+        EntryPoints: [src/handlers/worker.ts]
+
+  PaymentWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: paymentWebhook.handler
+      CodeUri: .
+      Description: PayFast ITN endpoint, marks orders as paid
+      Timeout: 20
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref Table }
+        - S3CrudPolicy: { BucketName: !Ref InvoiceBucket }
+      FunctionUrlConfig:
+        AuthType: NONE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Target: es2022
+        Sourcemap: true
+        External: ['@aws-sdk/*']
+        EntryPoints: [src/handlers/paymentWebhook.ts]
+
+  AdminApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: adminApi.handler
+      CodeUri: .
+      Description: JSON API for the admin website (Cognito JWT checked in code)
+      Timeout: 20
+      MemorySize: 512
+      Environment:
+        Variables:
+          PAYFAST_NOTIFY_URL: !GetAtt PaymentWebhookFunctionUrl.FunctionUrl
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref Table }
+        - S3CrudPolicy: { BucketName: !Ref InvoiceBucket }
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins: [!Ref AdminSiteOrigin]
+          AllowMethods: [GET, POST]
+          AllowHeaders: [authorization, content-type]
+          MaxAge: 86400
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Target: es2022
+        Sourcemap: true
+        External: ['@aws-sdk/*']
+        EntryPoints: [src/handlers/adminApi.ts]
+
+Outputs:
+  WhatsAppWebhookUrl:
+    Description: Paste into Meta - WhatsApp - Configuration - Callback URL
+    Value: !GetAtt WhatsAppWebhookFunctionUrl.FunctionUrl
+  PaymentWebhookUrl:
+    Description: PayFast ITN URL (already wired into payment links)
+    Value: !GetAtt PaymentWebhookFunctionUrl.FunctionUrl
+  AdminApiUrl:
+    Description: Base URL the admin website calls
+    Value: !GetAtt AdminApiFunctionUrl.FunctionUrl
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  InvoiceBucketName:
+    Value: !Ref InvoiceBucket
+  TableName:
+    Value: !Ref Table
